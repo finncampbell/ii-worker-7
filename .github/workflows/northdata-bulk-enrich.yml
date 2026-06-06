@@ -104,15 +104,13 @@ jobs:
                   if r.status_code == 200:
                       return r.text
                   if r.status_code == 429:
-                      # Back off progressively: 60s first hit, 120s second hit.
-                      # The longer delay means we rarely see a second 429.
-                      print(f"  429 rate limit — backing off 60s", flush=True)
-                      time.sleep(60)
+                      # Respect Northdata's own Retry-After header if present,
+                      # plus 5s buffer to ensure we're safely past their window.
+                      # Fall back to 30s if no header provided.
+                      wait = int(r.headers.get('Retry-After', 30)) + 5
+                      print(f"  429 rate limit — backing off {wait}s (Retry-After + 5s buffer)", flush=True)
+                      time.sleep(wait)
                       r = session.get(url, timeout=20, allow_redirects=True)
-                      if r.status_code == 429:
-                          print(f"  429 again — backing off 120s", flush=True)
-                          time.sleep(120)
-                          r = session.get(url, timeout=20, allow_redirects=True)
                       return r.text if r.status_code == 200 else None
                   if r.status_code == 404:
                       return None   # entity not on Northdata — skip silently
