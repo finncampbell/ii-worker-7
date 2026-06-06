@@ -127,9 +127,39 @@ jobs:
                   return m.group(1).strip()
               return None
 
-          def members_to_rows(members, rcs, entity_name, now_iso):
-              import requests as _r
+          from urllib.parse import unquote as url_unquote
+
+          def parse_person_url(url):
+              """Extract (city, person_id) from a Northdata person URL.
+              URL format: https://www.northdata.com/Last,First,City/id
+              The person_id is Northdata's cross-entity unique key for each individual.
+              """
+              if not url:
+                  return None, None
+              try:
+                  m = re.match(r'https?://www\.northdata\.com/(.+?)/([\w]+)$', url)
+                  if not m:
+                      return None, None
+                  path_part = url_unquote(m.group(1))
+                  person_id = m.group(2)
+                  parts = [p.strip() for p in path_part.split(',')]
+                  city  = parts[-1] if len(parts) >= 2 else None
+                  if city:
+                      city = city.replace('\xb7', '').strip() or None
+                  return city, person_id
+              except Exception:
+                  return None, None
+
+          def members_to_rows(members, rcs, entity_name, now_iso, biz=None):
               rows = []
+              # Entity-level fields from LocalBusiness — same for every officer row
+              entity_addr = (biz or {}).get("address", {})
+              ent_street   = entity_addr.get("streetAddress") or None
+              ent_postcode = entity_addr.get("postalCode") or None
+              ent_city     = entity_addr.get("addressLocality") or None
+              ent_country  = entity_addr.get("addressCountry") or None
+              ent_founding = (biz or {}).get("foundingDate") or None
+              ent_lei      = (biz or {}).get("leiCode") or None
               for p in members:
                   if p.get("@type") != "Person":
                       continue
@@ -142,8 +172,14 @@ jobs:
                   # Simple normalisation (no access to pipeline.utils here)
                   norm = re.sub(r'\s+', ' ', full.upper().strip())
                   role = (p.get("jobTitle") or "").strip() or None
+                  # country_of_residence from homeLocation (rarely populated)
                   home = p.get("homeLocation", {}).get("address", {})
                   country_res = home.get("addressCountry") or None
+                  # Richer person fields from URL
+                  person_url = (p.get("url") or "").strip() or None
+                  city_of_res, person_id = parse_person_url(person_url)
+                  alts = p.get("alternateName") or []
+                  alt_names = json.dumps(alts, ensure_ascii=False) if alts else None
                   raw = json.dumps({"source": "northdata_gh", "rcs": rcs, "person": p}, ensure_ascii=False)
                   rows.append({
                       "rcs_number": rcs,
@@ -167,6 +203,16 @@ jobs:
                       "birth_place": None,
                       "address_raw": None,
                       "pdf_source": 0,
+                      "northdata_person_id": person_id,
+                      "city_of_residence": city_of_res,
+                      "alternate_names": alt_names,
+                      "northdata_person_url": person_url,
+                      "entity_address_street": ent_street,
+                      "entity_address_postcode": ent_postcode,
+                      "entity_address_city": ent_city,
+                      "entity_address_country": ent_country,
+                      "entity_founding_date": ent_founding,
+                      "entity_lei_code": ent_lei,
                   })
               return rows
 
@@ -180,7 +226,7 @@ jobs:
                   return []
               members = biz.get("member", [])
               if members:
-                  return members_to_rows(members, rcs, name, now_iso)
+                  return members_to_rows(members, rcs, name, now_iso, biz=biz)
               if depth >= 1:
                   return []
               gp_name = get_gp_name(html)
