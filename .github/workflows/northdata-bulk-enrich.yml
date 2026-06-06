@@ -1,0 +1,301 @@
+# northdata-bulk-enrich.yml
+#
+# Bulk Northdata director enrichment — runs on GitHub Actions (Azure IPs).
+#
+# Triggered by:
+#   repository_dispatch with event_type: enrich-northdata
+#   Payload: { entities: [{rcs, name}, ...], chunk_index, total_chunks }
+#
+# Fired by:
+#   scripts/northdata_bulk_dispatch.py --source esma_lu   (bulk backfill)
+#   scripts/northdata_bulk_dispatch.py --source gleif_lu
+#   scripts/northdata_bulk_dispatch.py --rcs B308325 ...  (ad-hoc)
+#
+# What each runner does:
+#   1. Receives a chunk of up to 500 RCS numbers in the dispatch payload
+#   2. Runs the inline Python scraper against northdata.com/~lu/{rcs}
+#   3. Parses LocalBusiness.member[] JSON-LD from each page
+#   4. For SCSps with no members, follows "partner GP" one level
+#   5. POSTs all officer rows to SERVER_URL/api/v1/pipeline/ingest/northdata
+#
+# GitHub secrets required (Settings → Secrets → Actions):
+#   PIPELINE_SERVER_URL    — e.g. http://46.224.66.122
+#   PIPELINE_INGEST_TOKEN  — matches PIPELINE_INGEST_TOKEN on the server
+
+name: Northdata Bulk Enrich
+
+on:
+  repository_dispatch:
+    types: [enrich-northdata]
+
+  # Also allow manual trigger from the Actions UI (for testing)
+  workflow_dispatch:
+    inputs:
+      rcs_numbers:
+        description: "Comma-separated RCS numbers to enrich (test mode)"
+        required: false
+        default: "B308325,B302680"
+
+jobs:
+  enrich:
+    name: "Enrich chunk ${{ github.event.client_payload.chunk_index }} of ${{ github.event.client_payload.total_chunks }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # chunk of 500 at 1.5s = ~12min; 30min gives 2x headroom
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Build entity list
+        id: entities
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+
+          # repository_dispatch payload
+          payload_raw = os.getenv("DISPATCH_PAYLOAD", "")
+          if payload_raw:
+              payload = json.loads(payload_raw)
+              entities = payload.get("entities", [])
+          else:
+              # workflow_dispatch manual test
+              rcs_input = os.getenv("MANUAL_RCS", "B308325,B302680")
+              entities = [{"rcs": r.strip(), "name": ""} for r in rcs_input.split(",") if r.strip()]
+
+          print(f"Entities to process: {len(entities)}")
+          with open("entities.json", "w") as f:
+              json.dump(entities, f)
+
+          # Write to GITHUB_OUTPUT
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"count={len(entities)}\n")
+          PYEOF
+        env:
+          DISPATCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          MANUAL_RCS: ${{ github.event.inputs.rcs_numbers }}
+
+      - name: Scrape Northdata and collect officer rows
+        id: scrape
+        run: |
+          python - <<'PYEOF'
+          import json, re, time, sys, os
+          from datetime import datetime, timezone
+
+          def fetch_page(session, url):
+              import requests as _r
+              try:
+                  r = session.get(url, timeout=20, allow_redirects=True)
+                  if r.status_code == 200:
+                      return r.text
+                  if r.status_code == 429:
+                      print(f"  429 rate limit — backing off 30s", flush=True)
+                      time.sleep(30)
+                      r = session.get(url, timeout=20, allow_redirects=True)
+                      return r.text if r.status_code == 200 else None
+                  return None
+              except Exception as e:
+                  print(f"  request error: {e}", flush=True)
+                  return None
+
+          def get_local_business(html):
+              for raw in re.findall(
+                  r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                  html, re.DOTALL | re.IGNORECASE
+              ):
+                  try:
+                      d = json.loads(raw)
+                      if d.get("@type") == "LocalBusiness":
+                          return d
+                  except:
+                      pass
+              return None
+
+          def get_gp_name(html):
+              m = re.search(r'"partner ([^"&]{3,120}?)"[,\s]*["\n]', html, re.IGNORECASE)
+              if m:
+                  return m.group(1).strip()
+              m = re.search(r'Partner:\s*([A-Z][^<\n\xa0]{3,80})', html)
+              if m:
+                  return m.group(1).strip()
+              return None
+
+          def members_to_rows(members, rcs, entity_name, now_iso):
+              import requests as _r
+              rows = []
+              for p in members:
+                  if p.get("@type") != "Person":
+                      continue
+                  given  = (p.get("givenName") or "").strip()
+                  family = (p.get("familyName") or "").strip()
+                  title  = (p.get("honorificPrefix") or "").strip()
+                  full   = " ".join(filter(None, [title, given, family]))
+                  if not full:
+                      continue
+                  # Simple normalisation (no access to pipeline.utils here)
+                  norm = re.sub(r'\s+', ' ', full.upper().strip())
+                  role = (p.get("jobTitle") or "").strip() or None
+                  home = p.get("homeLocation", {}).get("address", {})
+                  country_res = home.get("addressCountry") or None
+                  raw = json.dumps({"source": "northdata_gh", "rcs": rcs, "person": p}, ensure_ascii=False)
+                  rows.append({
+                      "rcs_number": rcs,
+                      "entity_name": entity_name,
+                      "officer_name": full,
+                      "officer_name_normalised": norm,
+                      "officer_type": "INDIVIDUAL",
+                      "role": role,
+                      "role_en": role,
+                      "appointed_on": None,
+                      "resigned_on": None,
+                      "is_current": 1,
+                      "corporate_rcs_number": None,
+                      "corporate_country": None,
+                      "nationality": None,
+                      "country_of_residence": country_res,
+                      "ingested_at": now_iso,
+                      "source_filing_date": None,
+                      "raw_json": raw,
+                      "date_of_birth": None,
+                      "birth_place": None,
+                      "address_raw": None,
+                      "pdf_source": 0,
+                  })
+              return rows
+
+          def enrich_entity(session, rcs, name, now_iso, depth=0):
+              url  = f"https://www.northdata.com/~lu/{rcs}"
+              html = fetch_page(session, url)
+              if not html:
+                  return []
+              biz = get_local_business(html)
+              if not biz:
+                  return []
+              members = biz.get("member", [])
+              if members:
+                  return members_to_rows(members, rcs, name, now_iso)
+              if depth >= 1:
+                  return []
+              gp_name = get_gp_name(html)
+              if not gp_name:
+                  return []
+              print(f"  {rcs} has no members — following GP '{gp_name}'", flush=True)
+              import requests as _r
+              gp_url  = f"https://www.northdata.com/{_r.utils.quote(gp_name)}"
+              gp_html = fetch_page(session, gp_url)
+              if not gp_html:
+                  return []
+              time.sleep(1.5)
+              gp_rcs_m = re.search(r'href=["\'].*?/~lu/(B\d{4,8})["\']', gp_html, re.IGNORECASE)
+              if gp_rcs_m:
+                  return enrich_entity(session, gp_rcs_m.group(1), gp_name, now_iso, depth + 1)
+              return []
+
+          # ── Main ──────────────────────────────────────────────────────────
+          import requests
+
+          with open("entities.json") as f:
+              entities = json.load(f)
+
+          now_iso    = datetime.now(timezone.utc).isoformat()
+          all_rows   = []
+          rcs_done   = []
+          errors     = 0
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (compatible; investment-intelligence-pipeline/1.0; "
+                  "private research tool; contact: finncampbell@hotmail.co.uk)"
+              ),
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          })
+
+          for i, ent in enumerate(entities):
+              rcs  = ent["rcs"]
+              name = ent.get("name", "")
+              try:
+                  rows = enrich_entity(session, rcs, name, now_iso)
+                  all_rows.extend(rows)
+                  rcs_done.append(rcs)
+                  if rows:
+                      print(f"[{i+1}/{len(entities)}] {rcs}: {len(rows)} officers", flush=True)
+                  else:
+                      print(f"[{i+1}/{len(entities)}] {rcs}: 0 officers (no data)", flush=True)
+              except Exception as e:
+                  print(f"[{i+1}/{len(entities)}] {rcs}: ERROR — {e}", flush=True)
+                  errors += 1
+                  rcs_done.append(rcs)  # still mark as processed so queue moves on
+
+              if i < len(entities) - 1:
+                  time.sleep(1.5)
+
+          print(f"\nTotal officers found: {len(all_rows)}", flush=True)
+          print(f"Errors: {errors}", flush=True)
+
+          result = {"officers": all_rows, "rcs_numbers": rcs_done}
+          with open("results.json", "w") as f:
+              json.dump(result, f, ensure_ascii=False)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"officers={len(all_rows)}\n")
+              fh.write(f"errors={errors}\n")
+          PYEOF
+
+      - name: POST results to server
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+          import requests
+
+          server_url = os.environ["SERVER_URL"].rstrip("/")
+          token      = os.environ["INGEST_TOKEN"]
+          run_id     = os.environ.get("GITHUB_RUN_ID", "unknown")
+
+          with open("results.json") as f:
+              result = json.load(f)
+
+          payload = {
+              "officers":    result["officers"],
+              "rcs_numbers": result["rcs_numbers"],
+              "runner_id":   run_id,
+          }
+
+          print(f"POSTing {len(result['officers'])} officers for "
+                f"{len(result['rcs_numbers'])} entities to {server_url}", flush=True)
+
+          resp = requests.post(
+              f"{server_url}/api/v1/pipeline/ingest/northdata",
+              json=payload,
+              headers={"X-Pipeline-Token": token},
+              timeout=60,
+          )
+
+          if resp.status_code == 200:
+              data = resp.json()
+              print(f"Server accepted: inserted={data['inserted']} skipped={data['skipped']}", flush=True)
+          else:
+              print(f"Server error: HTTP {resp.status_code} — {resp.text[:300]}", flush=True)
+              sys.exit(1)
+          PYEOF
+        env:
+          SERVER_URL:    ${{ secrets.PIPELINE_SERVER_URL }}
+          INGEST_TOKEN:  ${{ secrets.PIPELINE_INGEST_TOKEN }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Northdata Enrichment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Entities processed | ${{ steps.entities.outputs.count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Officers found | ${{ steps.scrape.outputs.officers }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Errors | ${{ steps.scrape.outputs.errors }} |" >> $GITHUB_STEP_SUMMARY
