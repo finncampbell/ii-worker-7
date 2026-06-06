@@ -86,20 +86,37 @@ jobs:
         id: scrape
         run: |
           python - <<'PYEOF'
-          import json, re, time, sys, os
+          import json, re, time, sys, os, random
           from datetime import datetime, timezone
 
+          # Polite scraping delay — 2.5s base with ±0.5s jitter.
+          # Jitter breaks up periodic burst patterns that can trigger 429s
+          # even at low average rates. Never go below 2s.
+          DELAY_BASE   = 2.5
+          DELAY_JITTER = 0.5
+
+          def polite_sleep():
+              time.sleep(DELAY_BASE + random.uniform(-DELAY_JITTER, DELAY_JITTER))
+
           def fetch_page(session, url):
-              import requests as _r
               try:
                   r = session.get(url, timeout=20, allow_redirects=True)
                   if r.status_code == 200:
                       return r.text
                   if r.status_code == 429:
-                      print(f"  429 rate limit — backing off 30s", flush=True)
-                      time.sleep(30)
+                      # Back off progressively: 60s first hit, 120s second hit.
+                      # The longer delay means we rarely see a second 429.
+                      print(f"  429 rate limit — backing off 60s", flush=True)
+                      time.sleep(60)
                       r = session.get(url, timeout=20, allow_redirects=True)
+                      if r.status_code == 429:
+                          print(f"  429 again — backing off 120s", flush=True)
+                          time.sleep(120)
+                          r = session.get(url, timeout=20, allow_redirects=True)
                       return r.text if r.status_code == 200 else None
+                  if r.status_code == 404:
+                      return None   # entity not on Northdata — skip silently
+                  print(f"  HTTP {r.status_code} for {url}", flush=True)
                   return None
               except Exception as e:
                   print(f"  request error: {e}", flush=True)
@@ -238,7 +255,7 @@ jobs:
               gp_html = fetch_page(session, gp_url)
               if not gp_html:
                   return []
-              time.sleep(1.5)
+              polite_sleep()
               gp_rcs_m = re.search(r'href=["\'].*?/~lu/(B\d{4,8})["\']', gp_html, re.IGNORECASE)
               if gp_rcs_m:
                   return enrich_entity(session, gp_rcs_m.group(1), gp_name, now_iso, depth + 1)
@@ -281,7 +298,7 @@ jobs:
                   rcs_done.append(rcs)  # still mark as processed so queue moves on
 
               if i < len(entities) - 1:
-                  time.sleep(1.5)
+                  polite_sleep()
 
           print(f"\nTotal officers found: {len(all_rows)}", flush=True)
           print(f"Errors: {errors}", flush=True)
