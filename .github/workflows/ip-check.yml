@@ -1,0 +1,17 @@
+name: IP Check
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        run: [1, 2, 3]
+    name: "Check IP (instance ${{ matrix.run }})"
+    steps:
+      - name: Get public IP
+        run: |
+          IP=$(curl -s https://api.ipify.org)
+          echo "Runner IP: $IP"
+          echo "Repo: ${{ github.repository }}"
+          echo "Run instance: ${{ matrix.run }}"
