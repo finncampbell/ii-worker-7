@@ -40,7 +40,8 @@ jobs:
   enrich:
     name: "Enrich chunk ${{ github.event.client_payload.chunk_index }} of ${{ github.event.client_payload.total_chunks }}"
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # chunk of 500 at 1.5s = ~12min; 30min gives 2x headroom
+    timeout-minutes: 340  # GitHub hard limit is 6h (360min); 340 gives 20min buffer.
+                          # At Northdata's 30s Retry-After rate, 250 entities ~= 2.5h.
 
     steps:
       - name: Check out repository
