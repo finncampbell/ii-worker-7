@@ -59,7 +59,7 @@ jobs:
           HEARTBEAT_SEC     = 60     # heartbeat interval
           DELAY_BASE        = 2.5    # seconds between Northdata requests
           DELAY_JITTER      = 0.5
-          MAX_429_BACKOFF   = 120    # cap for progressive 429 backoff (seconds)
+          MAX_429_BACKOFF   = 90     # cap for progressive 429 backoff (seconds)
 
           print(f"Worker ID: {WORKER_ID}", flush=True)
 
