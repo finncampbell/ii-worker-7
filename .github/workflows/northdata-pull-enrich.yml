@@ -55,11 +55,10 @@ jobs:
           MATRIX_IDX   = os.environ.get("MATRIX_WORKER_INDEX", "1")
           WORKER_ID    = f"{REPO.split('/')[-1]}-{RUN_ID}-w{MATRIX_IDX}"
 
-          BATCH_SIZE        = 5      # claim 5 at a time — small batches reduce wasted work on timeout
-          HEARTBEAT_SEC     = 60     # heartbeat interval
-          DELAY_BASE        = 2.5    # seconds between Northdata requests
-          DELAY_JITTER      = 0.5
-          MAX_429_BACKOFF   = 90     # cap for progressive 429 backoff (seconds)
+          BATCH_SIZE    = 5    # claim 5 at a time — small batches reduce wasted work on timeout
+          HEARTBEAT_SEC = 60   # heartbeat interval
+          DELAY_BASE    = 8.0  # seconds between requests — reduces 429 frequency
+          DELAY_JITTER  = 1.0  # ± jitter to avoid burst patterns
 
           print(f"Worker ID: {WORKER_ID}", flush=True)
 
@@ -118,27 +117,24 @@ jobs:
           from urllib.parse import unquote as url_unquote
           import requests as _req
 
-          def fetch_page(scraper, url, consecutive_429s):
+          def fetch_page(scraper, url):
               try:
                   r = scraper.get(url, timeout=20, allow_redirects=True)
                   if r.status_code == 200:
-                      return r.text, 0   # reset 429 streak
+                      return r.text
                   if r.status_code == 429:
                       wait = int(r.headers.get("Retry-After", 30)) + 5
                       print(f"  429 — backing off {wait}s (Retry-After + 5s buffer)", flush=True)
                       time.sleep(wait)
-                      # Single retry after backoff
                       r2 = scraper.get(url, timeout=20, allow_redirects=True)
-                      if r2.status_code == 200:
-                          return r2.text, 0
-                      return None, consecutive_429s + 1
+                      return r2.text if r2.status_code == 200 else None
                   if r.status_code == 404:
-                      return None, consecutive_429s   # not on Northdata — normal
+                      return None   # not on Northdata — normal
                   print(f"  HTTP {r.status_code} for {url}", flush=True)
-                  return None, consecutive_429s
+                  return None
               except Exception as e:
                   print(f"  request error: {e}", flush=True)
-                  return None, consecutive_429s
+                  return None
 
           def get_local_business(html):
               for raw in re.findall(
@@ -232,36 +228,36 @@ jobs:
                   })
               return rows
 
-          def enrich_entity(scraper, rcs, name, now_iso, consecutive_429s, depth=0):
+          def enrich_entity(scraper, rcs, name, now_iso, depth=0):
               url  = f"https://www.northdata.com/~lu/{rcs}"
-              html, consecutive_429s = fetch_page(scraper, url, consecutive_429s)
+              html = fetch_page(scraper, url)
               if not html:
-                  return [], consecutive_429s
+                  return []
               biz = get_local_business(html)
               if not biz:
-                  return [], consecutive_429s
+                  return []
               members = biz.get("member", [])
               if members:
-                  return members_to_rows(members, rcs, name, now_iso, biz=biz), consecutive_429s
+                  return members_to_rows(members, rcs, name, now_iso, biz=biz)
               if depth >= 1:
-                  return [], consecutive_429s
+                  return []
               # SCSp with no members — follow the GP one level
               gp_m = re.search(r'"partner ([^"&]{3,120}?)"[,\s]*["\n]', html, re.IGNORECASE)
               if not gp_m:
                   gp_m = re.search(r'Partner:\s*([A-Z][^<\n\xa0]{3,80})', html)
               if not gp_m:
-                  return [], consecutive_429s
+                  return []
               gp_name = gp_m.group(1).strip()
               print(f"  {rcs} has no members — following GP '{gp_name}'", flush=True)
               gp_url  = f"https://www.northdata.com/{_req.utils.quote(gp_name)}"
-              gp_html, consecutive_429s = fetch_page(scraper, gp_url, consecutive_429s)
+              gp_html = fetch_page(scraper, gp_url)
               if not gp_html:
-                  return [], consecutive_429s
+                  return []
               polite_sleep()
               gp_rcs_m = re.search(r'href=["\'].*?/~lu/(B\d{4,8})["\']', gp_html, re.IGNORECASE)
               if gp_rcs_m:
-                  return enrich_entity(scraper, gp_rcs_m.group(1), gp_name, now_iso, consecutive_429s, depth + 1)
-              return [], consecutive_429s
+                  return enrich_entity(scraper, gp_rcs_m.group(1), gp_name, now_iso, depth + 1)
+              return []
 
           # ── Main worker loop ──────────────────────────────────────────────────
 
@@ -285,9 +281,8 @@ jobs:
           except Exception as e:
               print(f"Could not fetch queue status: {e}", flush=True)
 
-          total_processed  = 0
-          total_officers   = 0
-          consecutive_429s = 0   # used only to scale the extra backoff sleep
+          total_processed = 0
+          total_officers  = 0
 
           # Heartbeat thread — fires every HEARTBEAT_SEC while we hold items
           current_items = []
@@ -336,9 +331,7 @@ jobs:
                       name     = item.get("entity_name", "")
 
                       try:
-                          officers, consecutive_429s = enrich_entity(
-                              scraper_session, rcs, name, now_iso, consecutive_429s
-                          )
+                          officers = enrich_entity(scraper_session, rcs, name, now_iso)
                           result = queue_done(api_session, queue_id, officers)
                           total_processed += 1
                           total_officers  += result.get("inserted", 0)
@@ -360,15 +353,7 @@ jobs:
                       with current_items_lock:
                           current_items = [i for i in current_items if i["id"] != queue_id]
 
-                      # If we're being throttled, add an extra sleep on top of the
-                      # Retry-After wait already done in fetch_page. Cap at 120s.
-                      # Stays alive — no self-termination; a new workflow launch just
-                      # queues behind other workflows and gains nothing.
-                      if consecutive_429s > 0:
-                          extra = min(consecutive_429s * 30, MAX_429_BACKOFF)
-                          print(f"  throttle backoff: +{extra}s extra sleep (streak={consecutive_429s})", flush=True)
-                          time.sleep(extra)
-                      elif item != items[-1]:
+                      if item != items[-1]:
                           polite_sleep()
 
           finally:
