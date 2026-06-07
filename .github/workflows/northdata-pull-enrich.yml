@@ -1,0 +1,404 @@
+# northdata-pull-enrich.yml
+#
+# Pull-based Northdata director enrichment — workers pull from a shared queue
+# on the server rather than receiving a fixed entity list at dispatch time.
+#
+# Architecture:
+#   - Workers claim batches of entities from the server's queue API
+#   - Each entity is processed and saved immediately (/queue/done)
+#   - Workers heartbeat every 60s to prevent stale-reaper reclaim
+#   - After 3 consecutive 429s the worker exits cleanly (fresh IP will pick up)
+#   - Matrix of 5 workers per repo means 50 concurrent workers across 10 repos
+#
+# Triggered by:
+#   workflow_dispatch (manual or via scripts/northdata_start_workers.py)
+#
+# GitHub secrets required:
+#   PIPELINE_SERVER_URL    — e.g. http://46.224.66.122
+#   PIPELINE_INGEST_TOKEN  — matches PIPELINE_INGEST_TOKEN on the server
+
+name: Northdata Pull Enrich
+
+on:
+  workflow_dispatch:
+
+jobs:
+  worker:
+    name: "Worker ${{ matrix.worker_index }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # GitHub hard limit 6h (360min); 20min buffer
+
+    strategy:
+      fail-fast: false      # one worker failing should not kill the rest
+      matrix:
+        worker_index: [1, 2, 3, 4, 5]
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run pull-based enrichment worker
+        run: |
+          python - <<'PYEOF'
+          import json, re, time, sys, os, random, threading
+          from datetime import datetime, timezone
+
+          SERVER_URL   = os.environ["SERVER_URL"].rstrip("/")
+          TOKEN        = os.environ["INGEST_TOKEN"]
+          REPO         = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          RUN_ID       = os.environ.get("GITHUB_RUN_ID", "unknown")
+          MATRIX_IDX   = os.environ.get("MATRIX_WORKER_INDEX", "1")
+          WORKER_ID    = f"{REPO.split('/')[-1]}-{RUN_ID}-w{MATRIX_IDX}"
+
+          BATCH_SIZE        = 5      # claim 5 at a time — small batches reduce wasted work on timeout
+          HEARTBEAT_SEC     = 60     # heartbeat interval
+          DELAY_BASE        = 2.5    # seconds between Northdata requests
+          DELAY_JITTER      = 0.5
+          MAX_429_STREAK    = 3      # consecutive 429s before self-termination
+
+          print(f"Worker ID: {WORKER_ID}", flush=True)
+
+          # ── Helpers ───────────────────────────────────────────────────────────
+
+          def polite_sleep():
+              time.sleep(DELAY_BASE + random.uniform(-DELAY_JITTER, DELAY_JITTER))
+
+          def api_headers():
+              return {"X-Pipeline-Token": TOKEN, "Content-Type": "application/json"}
+
+          def queue_claim(session):
+              r = session.post(
+                  f"{SERVER_URL}/api/v1/queue/claim",
+                  json={"worker_id": WORKER_ID, "batch_size": BATCH_SIZE},
+                  headers=api_headers(),
+                  timeout=30,
+              )
+              r.raise_for_status()
+              return r.json()   # {items: [...], queue_remaining: N}
+
+          def queue_done(session, queue_id, officers, error=None):
+              payload = {
+                  "queue_id":  queue_id,
+                  "worker_id": WORKER_ID,
+                  "officers":  officers,
+              }
+              if error:
+                  payload["error"] = error
+              r = session.post(
+                  f"{SERVER_URL}/api/v1/queue/done",
+                  json=payload,
+                  headers=api_headers(),
+                  timeout=30,
+              )
+              r.raise_for_status()
+              return r.json()
+
+          def queue_heartbeat(session, queue_ids):
+              if not queue_ids:
+                  return
+              session.post(
+                  f"{SERVER_URL}/api/v1/queue/heartbeat",
+                  json={"queue_ids": queue_ids, "worker_id": WORKER_ID},
+                  headers=api_headers(),
+                  timeout=10,
+              )
+
+          def queue_status(session):
+              r = session.get(f"{SERVER_URL}/api/v1/queue/status", timeout=10)
+              r.raise_for_status()
+              return r.json()
+
+          # ── Northdata scraping (same as bulk-enrich workflow) ─────────────────
+
+          from urllib.parse import unquote as url_unquote
+          import requests as _req
+
+          def fetch_page(scraper, url, consecutive_429s):
+              try:
+                  r = scraper.get(url, timeout=20, allow_redirects=True)
+                  if r.status_code == 200:
+                      return r.text, 0   # reset 429 streak
+                  if r.status_code == 429:
+                      wait = int(r.headers.get("Retry-After", 30)) + 5
+                      print(f"  429 — backing off {wait}s (Retry-After + 5s buffer)", flush=True)
+                      time.sleep(wait)
+                      # Single retry after backoff
+                      r2 = scraper.get(url, timeout=20, allow_redirects=True)
+                      if r2.status_code == 200:
+                          return r2.text, 0
+                      return None, consecutive_429s + 1
+                  if r.status_code == 404:
+                      return None, consecutive_429s   # not on Northdata — normal
+                  print(f"  HTTP {r.status_code} for {url}", flush=True)
+                  return None, consecutive_429s
+              except Exception as e:
+                  print(f"  request error: {e}", flush=True)
+                  return None, consecutive_429s
+
+          def get_local_business(html):
+              for raw in re.findall(
+                  r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                  html, re.DOTALL | re.IGNORECASE
+              ):
+                  try:
+                      d = json.loads(raw)
+                      if d.get("@type") == "LocalBusiness":
+                          return d
+                  except Exception:
+                      pass
+              return None
+
+          def parse_person_url(url):
+              if not url:
+                  return None, None
+              try:
+                  m = re.match(r'https?://www\.northdata\.com/(.+?)/([\w]+)$', url)
+                  if not m:
+                      return None, None
+                  path_part = url_unquote(m.group(1))
+                  person_id = m.group(2)
+                  parts = [p.strip() for p in path_part.split(',')]
+                  city = parts[-1] if len(parts) >= 2 else None
+                  if city:
+                      city = city.replace('\xb7', '').strip() or None
+                  return city, person_id
+              except Exception:
+                  return None, None
+
+          def members_to_rows(members, rcs, entity_name, now_iso, biz=None):
+              rows = []
+              entity_addr  = (biz or {}).get("address", {})
+              ent_street   = entity_addr.get("streetAddress") or None
+              ent_postcode = entity_addr.get("postalCode") or None
+              ent_city     = entity_addr.get("addressLocality") or None
+              ent_country  = entity_addr.get("addressCountry") or None
+              ent_founding = (biz or {}).get("foundingDate") or None
+              ent_lei      = (biz or {}).get("leiCode") or None
+              for p in members:
+                  if p.get("@type") != "Person":
+                      continue
+                  given  = (p.get("givenName") or "").strip()
+                  family = (p.get("familyName") or "").strip()
+                  title  = (p.get("honorificPrefix") or "").strip()
+                  full   = " ".join(filter(None, [title, given, family]))
+                  if not full:
+                      continue
+                  norm = re.sub(r'\s+', ' ', full.upper().strip())
+                  role = (p.get("jobTitle") or "").strip() or None
+                  home = p.get("homeLocation", {}).get("address", {})
+                  country_res  = home.get("addressCountry") or None
+                  person_url   = (p.get("url") or "").strip() or None
+                  city_of_res, person_id = parse_person_url(person_url)
+                  alts = p.get("alternateName") or []
+                  alt_names = json.dumps(alts, ensure_ascii=False) if alts else None
+                  raw = json.dumps({"source": "northdata_pull", "rcs": rcs, "person": p}, ensure_ascii=False)
+                  rows.append({
+                      "rcs_number": rcs,
+                      "entity_name": entity_name,
+                      "officer_name": full,
+                      "officer_name_normalised": norm,
+                      "officer_type": "INDIVIDUAL",
+                      "role": role,
+                      "role_en": role,
+                      "appointed_on": None,
+                      "resigned_on": None,
+                      "is_current": 1,
+                      "corporate_rcs_number": None,
+                      "corporate_country": None,
+                      "nationality": None,
+                      "country_of_residence": country_res,
+                      "ingested_at": now_iso,
+                      "source_filing_date": None,
+                      "raw_json": raw,
+                      "date_of_birth": None,
+                      "birth_place": None,
+                      "address_raw": None,
+                      "pdf_source": 0,
+                      "northdata_person_id": person_id,
+                      "city_of_residence": city_of_res,
+                      "alternate_names": alt_names,
+                      "northdata_person_url": person_url,
+                      "entity_address_street": ent_street,
+                      "entity_address_postcode": ent_postcode,
+                      "entity_address_city": ent_city,
+                      "entity_address_country": ent_country,
+                      "entity_founding_date": ent_founding,
+                      "entity_lei_code": ent_lei,
+                  })
+              return rows
+
+          def enrich_entity(scraper, rcs, name, now_iso, consecutive_429s, depth=0):
+              url  = f"https://www.northdata.com/~lu/{rcs}"
+              html, consecutive_429s = fetch_page(scraper, url, consecutive_429s)
+              if not html:
+                  return [], consecutive_429s
+              biz = get_local_business(html)
+              if not biz:
+                  return [], consecutive_429s
+              members = biz.get("member", [])
+              if members:
+                  return members_to_rows(members, rcs, name, now_iso, biz=biz), consecutive_429s
+              if depth >= 1:
+                  return [], consecutive_429s
+              # SCSp with no members — follow the GP one level
+              gp_m = re.search(r'"partner ([^"&]{3,120}?)"[,\s]*["\n]', html, re.IGNORECASE)
+              if not gp_m:
+                  gp_m = re.search(r'Partner:\s*([A-Z][^<\n\xa0]{3,80})', html)
+              if not gp_m:
+                  return [], consecutive_429s
+              gp_name = gp_m.group(1).strip()
+              print(f"  {rcs} has no members — following GP '{gp_name}'", flush=True)
+              gp_url  = f"https://www.northdata.com/{_req.utils.quote(gp_name)}"
+              gp_html, consecutive_429s = fetch_page(scraper, gp_url, consecutive_429s)
+              if not gp_html:
+                  return [], consecutive_429s
+              polite_sleep()
+              gp_rcs_m = re.search(r'href=["\'].*?/~lu/(B\d{4,8})["\']', gp_html, re.IGNORECASE)
+              if gp_rcs_m:
+                  return enrich_entity(scraper, gp_rcs_m.group(1), gp_name, now_iso, consecutive_429s, depth + 1)
+              return [], consecutive_429s
+
+          # ── Main worker loop ──────────────────────────────────────────────────
+
+          import requests
+
+          api_session = requests.Session()
+          scraper_session = requests.Session()
+          scraper_session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (compatible; investment-intelligence-pipeline/1.0; "
+                  "private research tool; contact: finncampbell@hotmail.co.uk)"
+              ),
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          })
+
+          # Print initial queue status
+          try:
+              qs = queue_status(api_session)
+              print(f"Queue: {qs['progress_bar']} — {qs['done']}/{qs['total']} done, "
+                    f"{qs['pending']} pending, {qs['processing']} processing", flush=True)
+          except Exception as e:
+              print(f"Could not fetch queue status: {e}", flush=True)
+
+          total_processed = 0
+          total_officers  = 0
+          consecutive_429s = 0
+
+          # Heartbeat thread — fires every HEARTBEAT_SEC while we hold items
+          current_items = []
+          current_items_lock = threading.Lock()
+          stop_heartbeat = threading.Event()
+
+          def heartbeat_loop():
+              while not stop_heartbeat.is_set():
+                  time.sleep(HEARTBEAT_SEC)
+                  with current_items_lock:
+                      ids = [item["id"] for item in current_items]
+                  if ids:
+                      try:
+                          queue_heartbeat(api_session, ids)
+                      except Exception as e:
+                          print(f"  heartbeat failed: {e}", flush=True)
+
+          hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+          hb_thread.start()
+
+          try:
+              while True:
+                  # Self-terminate on sustained IP throttling
+                  if consecutive_429s >= MAX_429_STREAK:
+                      print(
+                          f"\n{MAX_429_STREAK} consecutive 429s — IP is throttled. "
+                          "Exiting cleanly; stale-reaper will requeue current items "
+                          "for a fresh runner to pick up.",
+                          flush=True,
+                      )
+                      break
+
+                  # Claim next batch
+                  try:
+                      claim = queue_claim(api_session)
+                  except Exception as e:
+                      print(f"Claim failed: {e} — retrying in 30s", flush=True)
+                      time.sleep(30)
+                      continue
+
+                  items = claim.get("items", [])
+                  remaining = claim.get("queue_remaining", 0)
+
+                  if not items:
+                      print(f"\nQueue exhausted (remaining={remaining}). Worker done.", flush=True)
+                      break
+
+                  with current_items_lock:
+                      current_items = items
+
+                  now_iso = datetime.now(timezone.utc).isoformat()
+
+                  for item in items:
+                      queue_id   = item["id"]
+                      rcs        = item["rcs_number"]
+                      name       = item.get("entity_name", "")
+
+                      try:
+                          officers, consecutive_429s = enrich_entity(
+                              scraper_session, rcs, name, now_iso, consecutive_429s
+                          )
+                          result = queue_done(api_session, queue_id, officers)
+                          total_processed += 1
+                          total_officers  += result.get("inserted", 0)
+                          print(
+                              f"[{total_processed}] {rcs}: "
+                              f"{len(officers)} officers scraped, "
+                              f"{result.get('inserted', 0)} inserted "
+                              f"(queue remaining: {remaining})",
+                              flush=True,
+                          )
+                      except Exception as e:
+                          print(f"  {rcs}: error — {e}", flush=True)
+                          try:
+                              queue_done(api_session, queue_id, [], error=str(e))
+                          except Exception:
+                              pass  # best effort — stale-reaper will recover
+                          total_processed += 1
+
+                      with current_items_lock:
+                          current_items = [i for i in current_items if i["id"] != queue_id]
+
+                      # Self-terminate check after each entity
+                      if consecutive_429s >= MAX_429_STREAK:
+                          break
+
+                      # Polite delay before next Northdata request
+                      if item != items[-1]:
+                          polite_sleep()
+
+                  if consecutive_429s >= MAX_429_STREAK:
+                      print(
+                          f"\n{MAX_429_STREAK} consecutive 429s after processing batch. "
+                          "Exiting — stale-reaper will requeue any remaining held items.",
+                          flush=True,
+                      )
+                      break
+
+          finally:
+              stop_heartbeat.set()
+
+          # Final status
+          try:
+              qs = queue_status(api_session)
+              print(f"\nFinal queue: {qs['progress_bar']}", flush=True)
+              print(f"This worker: {total_processed} entities, {total_officers} officers inserted", flush=True)
+          except Exception:
+              print(f"\nThis worker: {total_processed} entities, {total_officers} officers inserted", flush=True)
+
+          PYEOF
+        env:
+          SERVER_URL:           ${{ secrets.PIPELINE_SERVER_URL }}
+          INGEST_TOKEN:         ${{ secrets.PIPELINE_INGEST_TOKEN }}
+          MATRIX_WORKER_INDEX:  ${{ matrix.worker_index }}
