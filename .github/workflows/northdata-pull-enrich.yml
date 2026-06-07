@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false      # one worker failing should not kill the rest
       matrix:
-        worker_index: [1, 2, 3, 4, 5]
+        worker_index: [1, 2]
 
     steps:
       - name: Set up Python
@@ -59,7 +59,7 @@ jobs:
           HEARTBEAT_SEC     = 60     # heartbeat interval
           DELAY_BASE        = 2.5    # seconds between Northdata requests
           DELAY_JITTER      = 0.5
-          MAX_429_STREAK    = 3      # consecutive 429s before self-termination
+          MAX_429_BACKOFF   = 120    # cap for progressive 429 backoff (seconds)
 
           print(f"Worker ID: {WORKER_ID}", flush=True)
 
@@ -285,9 +285,9 @@ jobs:
           except Exception as e:
               print(f"Could not fetch queue status: {e}", flush=True)
 
-          total_processed = 0
-          total_officers  = 0
-          consecutive_429s = 0
+          total_processed  = 0
+          total_officers   = 0
+          consecutive_429s = 0   # used only to scale the extra backoff sleep
 
           # Heartbeat thread — fires every HEARTBEAT_SEC while we hold items
           current_items = []
@@ -310,16 +310,6 @@ jobs:
 
           try:
               while True:
-                  # Self-terminate on sustained IP throttling
-                  if consecutive_429s >= MAX_429_STREAK:
-                      print(
-                          f"\n{MAX_429_STREAK} consecutive 429s — IP is throttled. "
-                          "Exiting cleanly; stale-reaper will requeue current items "
-                          "for a fresh runner to pick up.",
-                          flush=True,
-                      )
-                      break
-
                   # Claim next batch
                   try:
                       claim = queue_claim(api_session)
@@ -341,9 +331,9 @@ jobs:
                   now_iso = datetime.now(timezone.utc).isoformat()
 
                   for item in items:
-                      queue_id   = item["id"]
-                      rcs        = item["rcs_number"]
-                      name       = item.get("entity_name", "")
+                      queue_id = item["id"]
+                      rcs      = item["rcs_number"]
+                      name     = item.get("entity_name", "")
 
                       try:
                           officers, consecutive_429s = enrich_entity(
@@ -370,21 +360,16 @@ jobs:
                       with current_items_lock:
                           current_items = [i for i in current_items if i["id"] != queue_id]
 
-                      # Self-terminate check after each entity
-                      if consecutive_429s >= MAX_429_STREAK:
-                          break
-
-                      # Polite delay before next Northdata request
-                      if item != items[-1]:
+                      # If we're being throttled, add an extra sleep on top of the
+                      # Retry-After wait already done in fetch_page. Cap at 120s.
+                      # Stays alive — no self-termination; a new workflow launch just
+                      # queues behind other workflows and gains nothing.
+                      if consecutive_429s > 0:
+                          extra = min(consecutive_429s * 30, MAX_429_BACKOFF)
+                          print(f"  throttle backoff: +{extra}s extra sleep (streak={consecutive_429s})", flush=True)
+                          time.sleep(extra)
+                      elif item != items[-1]:
                           polite_sleep()
-
-                  if consecutive_429s >= MAX_429_STREAK:
-                      print(
-                          f"\n{MAX_429_STREAK} consecutive 429s after processing batch. "
-                          "Exiting — stale-reaper will requeue any remaining held items.",
-                          flush=True,
-                      )
-                      break
 
           finally:
               stop_heartbeat.set()
