@@ -1,0 +1,365 @@
+# northdata-person-scrape.yml
+#
+# Pull-based Northdata person profile scraper.
+# Each worker claims batches of person IDs, scrapes their Northdata profile page,
+# extracts employment history (memberOf), and saves via /person-queue/done.
+#
+# What we extract from each person profile:
+#   - Current employer name, URL, RCS number
+#   - Full memberOf history (all firms ever listed, with start/end dates and role)
+#   - City and country of residence
+#
+# This data identifies the investment advisory firms behind AIFM-hosted funds
+# and surfaces spinout signals (departure from known manager → new entity).
+#
+# Architecture: identical pull-based pattern to northdata-pull-enrich.yml
+#   - Workers claim from /api/v1/person-queue/claim
+#   - Save via /api/v1/person-queue/done after each person
+#   - Heartbeat every 60s
+#   - Exit cleanly on 3 consecutive 429s
+#
+# Rate limit: Northdata allows ~1 req/3s sustained; we use 3s base delay.
+# 31,551 persons × 3s = ~26hrs — needs multiple 340-min workflow runs.
+
+name: Northdata Person Scrape
+
+on:
+  workflow_dispatch:
+
+jobs:
+  worker:
+    name: "Person Worker ${{ matrix.worker_index }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: [1, 2, 3, 4, 5]
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run person profile scraper
+        env:
+          SERVER_URL:           ${{ secrets.PIPELINE_SERVER_URL }}
+          INGEST_TOKEN:         ${{ secrets.PIPELINE_INGEST_TOKEN }}
+          MATRIX_WORKER_INDEX:  ${{ matrix.worker_index }}
+        run: |
+          python - <<'PYEOF'
+          import json, re, time, sys, os, random, threading
+          from datetime import datetime, timezone
+          from urllib.parse import unquote as url_unquote
+
+          SERVER_URL  = os.environ["SERVER_URL"].rstrip("/")
+          TOKEN       = os.environ["INGEST_TOKEN"]
+          REPO        = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          RUN_ID      = os.environ.get("GITHUB_RUN_ID", "unknown")
+          MATRIX_IDX  = os.environ.get("MATRIX_WORKER_INDEX", "1")
+          WORKER_ID   = f"{REPO.split('/')[-1]}-{RUN_ID}-p{MATRIX_IDX}"
+
+          BATCH_SIZE    = 3     # small batches — person pages are slower/heavier
+          HEARTBEAT_SEC = 60
+          DELAY_BASE    = 3.5   # seconds between requests — Northdata person pages
+          DELAY_JITTER  = 0.8
+
+          print(f"Worker ID: {WORKER_ID}", flush=True)
+
+          # ── Helpers ───────────────────────────────────────────────────────────
+
+          def polite_sleep():
+              time.sleep(DELAY_BASE + random.uniform(-DELAY_JITTER, DELAY_JITTER))
+
+          def api_headers():
+              return {"X-Pipeline-Token": TOKEN, "Content-Type": "application/json"}
+
+          def claim(session):
+              r = session.post(
+                  f"{SERVER_URL}/api/v1/person-queue/claim",
+                  json={"worker_id": WORKER_ID, "batch_size": BATCH_SIZE},
+                  headers=api_headers(), timeout=30,
+              )
+              r.raise_for_status()
+              return r.json()
+
+          def done(session, queue_id, profile=None, error=None, person_id=None):
+              payload = {"queue_id": queue_id, "worker_id": WORKER_ID}
+              if profile:
+                  payload["profile"] = profile
+              if error:
+                  payload["error"] = error[:500]
+              for attempt in range(1, 5):
+                  try:
+                      r = session.post(
+                          f"{SERVER_URL}/api/v1/person-queue/done",
+                          json=payload, headers=api_headers(), timeout=60,
+                      )
+                      r.raise_for_status()
+                      return r.json()
+                  except Exception as e:
+                      print(f"  done attempt {attempt}/4 failed for {person_id or queue_id}: {e}", flush=True)
+                      if attempt < 4:
+                          time.sleep(15 * attempt)
+              # Final fallback — mark as failed so it gets requeued next run
+              try:
+                  session.post(
+                      f"{SERVER_URL}/api/v1/person-queue/done",
+                      json={"queue_id": queue_id, "worker_id": WORKER_ID,
+                            "error": f"done endpoint unreachable after 4 attempts"},
+                      headers=api_headers(), timeout=30,
+                  )
+              except Exception:
+                  pass
+
+          # ── Heartbeat thread ──────────────────────────────────────────────────
+
+          _active_ids = []
+          _ids_lock   = threading.Lock()
+
+          def heartbeat_loop(session):
+              while True:
+                  time.sleep(HEARTBEAT_SEC)
+                  with _ids_lock:
+                      ids = list(_active_ids)
+                  if not ids:
+                      continue
+                  try:
+                      session.post(
+                          f"{SERVER_URL}/api/v1/person-queue/heartbeat",
+                          json={"queue_ids": ids, "worker_id": WORKER_ID},
+                          headers=api_headers(), timeout=15,
+                      )
+                  except Exception as e:
+                      print(f"  heartbeat error: {e}", flush=True)
+
+          # ── Page fetch ────────────────────────────────────────────────────────
+
+          def fetch_page(session, url):
+              try:
+                  r = session.get(url, timeout=25, allow_redirects=True)
+                  if r.status_code == 200:
+                      return r.text
+                  if r.status_code == 429:
+                      wait = int(r.headers.get("Retry-After", 35)) + 5
+                      print(f"  429 — backing off {wait}s", flush=True)
+                      time.sleep(wait)
+                      r2 = session.get(url, timeout=25, allow_redirects=True)
+                      return r2.text if r2.status_code == 200 else None
+                  if r.status_code == 404:
+                      return None
+                  print(f"  HTTP {r.status_code} for {url}", flush=True)
+                  return None
+              except Exception as e:
+                  print(f"  request error: {e}", flush=True)
+                  return None
+
+          # ── JSON-LD extraction ────────────────────────────────────────────────
+
+          def get_person_jsonld(html):
+              """Extract Person JSON-LD block from Northdata person profile page."""
+              for raw in re.findall(
+                  r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                  html, re.DOTALL | re.IGNORECASE,
+              ):
+                  try:
+                      d = json.loads(raw)
+                      if d.get("@type") == "Person":
+                          return d
+                  except Exception:
+                      pass
+              return None
+
+          def parse_rcs_from_url(url):
+              """Extract RCS number from a Northdata company URL like /xxx/Bxxxxxx."""
+              if not url:
+                  return None
+              m = re.search(r'/([A-Z]\d{4,8})(?:[/?#]|$)', url)
+              return m.group(1) if m else None
+
+          def parse_person_profile(person_id, html):
+              """Parse a Northdata person profile page into a structured profile dict."""
+              if not html:
+                  return None
+
+              p = get_person_jsonld(html)
+              now_iso = datetime.now(timezone.utc).isoformat()
+
+              if not p:
+                  # Page loaded but no Person JSON-LD — Northdata has the page
+                  # but hasn't structured it. Return a minimal stub so we mark DONE.
+                  return {
+                      "northdata_person_id":  person_id,
+                      "canonical_name":       None,
+                      "city_of_residence":    None,
+                      "country_of_residence": None,
+                      "current_employer":     None,
+                      "current_employer_rcs": None,
+                      "current_employer_url": None,
+                      "member_of_json":       None,
+                      "raw_json":             None,
+                      "scraped_at":           now_iso,
+                  }
+
+              given  = (p.get("givenName")  or "").strip()
+              family = (p.get("familyName") or "").strip()
+              title  = (p.get("honorificPrefix") or "").strip()
+              name   = " ".join(filter(None, [title, given, family])) or None
+
+              home = p.get("homeLocation", {}).get("address", {})
+              city    = home.get("addressLocality") or None
+              country = home.get("addressCountry")  or None
+
+              # memberOf — list of all organisations this person has been linked to
+              member_of_raw = p.get("memberOf") or []
+              if isinstance(member_of_raw, dict):
+                  member_of_raw = [member_of_raw]
+
+              member_of_entries = []
+              current_employer     = None
+              current_employer_url = None
+              current_employer_rcs = None
+
+              for org in member_of_raw:
+                  if not isinstance(org, dict):
+                      continue
+                  org_name   = (org.get("name") or "").replace('\xad', '').strip() or None
+                  org_url    = org.get("url") or None
+                  org_rcs    = parse_rcs_from_url(org_url)
+                  role       = (org.get("roleName") or org.get("jobTitle") or "").strip() or None
+                  start_date = org.get("startDate") or None
+                  end_date   = org.get("endDate")   or None
+                  # Northdata marks current roles with no endDate or endDate=None
+                  is_current = (end_date is None)
+
+                  entry = {
+                      "name":       org_name,
+                      "url":        org_url,
+                      "rcs":        org_rcs,
+                      "role":       role,
+                      "start":      start_date,
+                      "end":        end_date,
+                      "isCurrent":  is_current,
+                  }
+                  member_of_entries.append(entry)
+
+                  # Use the most recently started current role as "current employer"
+                  if is_current and org_name:
+                      if current_employer is None:
+                          current_employer     = org_name
+                          current_employer_url = org_url
+                          current_employer_rcs = org_rcs
+                      elif start_date and (entry.get("start") or "") > (current_employer_url or ""):
+                          current_employer     = org_name
+                          current_employer_url = org_url
+                          current_employer_rcs = org_rcs
+
+              member_of_json = json.dumps(member_of_entries, ensure_ascii=False) if member_of_entries else None
+              raw_json = json.dumps({"source": "northdata_person", "person": p}, ensure_ascii=False)
+
+              return {
+                  "northdata_person_id":  person_id,
+                  "canonical_name":       name,
+                  "city_of_residence":    city,
+                  "country_of_residence": country,
+                  "current_employer":     current_employer,
+                  "current_employer_rcs": current_employer_rcs,
+                  "current_employer_url": current_employer_url,
+                  "member_of_json":       member_of_json,
+                  "raw_json":             raw_json,
+                  "scraped_at":           now_iso,
+              }
+
+          # ── Main worker loop ──────────────────────────────────────────────────
+
+          import requests
+          scraper = requests.Session()
+          scraper.headers.update({
+              "User-Agent": "Mozilla/5.0 (compatible; investment-intelligence/1.0)",
+              "Accept-Language": "en-GB,en;q=0.9",
+          })
+
+          hb_session = requests.Session()
+          hb_session.headers.update(scraper.headers)
+          hb_thread = threading.Thread(target=heartbeat_loop, args=(hb_session,), daemon=True)
+          hb_thread.start()
+
+          consecutive_429s = 0
+          total_done = 0
+
+          while True:
+              try:
+                  batch = claim(scraper)
+              except Exception as e:
+                  print(f"Claim failed: {e} — sleeping 30s", flush=True)
+                  time.sleep(30)
+                  continue
+
+              items = batch.get("items", [])
+              remaining = batch.get("queue_remaining", 0)
+
+              if not items:
+                  print(f"Queue empty — {total_done} persons processed. Exiting.", flush=True)
+                  break
+
+              print(f"Claimed {len(items)} persons | remaining: {remaining}", flush=True)
+
+              with _ids_lock:
+                  _active_ids[:] = [it["id"] for it in items]
+
+              for item in items:
+                  qid        = item["id"]
+                  person_id  = item["northdata_person_id"]
+                  person_url = item["person_url"]
+                  name       = item.get("canonical_name", "")
+
+                  print(f"  {person_id} — {name}", flush=True)
+
+                  html = fetch_page(scraper, person_url)
+                  polite_sleep()
+
+                  if html is None:
+                      # 404 or persistent error — mark done with no profile data
+                      # (person not on Northdata, or page gone — no point retrying)
+                      done(scraper, qid, error=None, profile={
+                          "northdata_person_id": person_id,
+                          "scraped_at": datetime.now(timezone.utc).isoformat(),
+                      }, person_id=person_id)
+                      with _ids_lock:
+                          if qid in _active_ids:
+                              _active_ids.remove(qid)
+                      consecutive_429s = 0
+                      total_done += 1
+                      continue
+
+                  # Check if we were rate-limited after the fetch
+                  if html and "429" in html[:200]:
+                      consecutive_429s += 1
+                      if consecutive_429s >= 3:
+                          print("3 consecutive 429s — exiting cleanly for fresh IP", flush=True)
+                          sys.exit(0)
+                      time.sleep(60)
+                      continue
+
+                  consecutive_429s = 0
+                  profile = parse_person_profile(person_id, html)
+
+                  if profile:
+                      employer = profile.get("current_employer") or "no employer"
+                      roles    = len(json.loads(profile.get("member_of_json") or "[]"))
+                      print(f"    → {roles} roles | employer: {employer}", flush=True)
+
+                  done(scraper, qid, profile=profile, person_id=person_id)
+
+                  with _ids_lock:
+                      if qid in _active_ids:
+                          _active_ids.remove(qid)
+                  total_done += 1
+
+          print(f"Worker finished. Total processed: {total_done}", flush=True)
+          PYEOF
